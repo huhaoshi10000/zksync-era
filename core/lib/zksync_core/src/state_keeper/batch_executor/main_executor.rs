@@ -13,7 +13,7 @@ use multivm::{
 use once_cell::sync::OnceCell;
 use tokio::sync::{mpsc, watch};
 use zksync_dal::ConnectionPool;
-use zksync_state::{RocksdbStorage, StorageView, WriteStorage};
+use zksync_state::{ReadStorage, SecondaryStorage, StorageView, WriteStorage};
 use zksync_types::{vm_trace::Call, Transaction, U256};
 use zksync_utils::bytecode::CompressedBytecodeInfo;
 
@@ -37,6 +37,7 @@ pub struct MainBatchExecutor {
     upload_witness_inputs_to_gcs: bool,
     enum_index_migration_chunk_size: usize,
     optional_bytecode_compression: bool,
+    secondary_storage: SecondaryStorage,
 }
 
 impl MainBatchExecutor {
@@ -57,6 +58,7 @@ impl MainBatchExecutor {
             upload_witness_inputs_to_gcs,
             enum_index_migration_chunk_size,
             optional_bytecode_compression,
+            secondary_storage: SecondaryStorage::new(),
         }
     }
 }
@@ -69,20 +71,6 @@ impl BatchExecutor for MainBatchExecutor {
         system_env: SystemEnv,
         stop_receiver: &watch::Receiver<bool>,
     ) -> Option<BatchExecutorHandle> {
-        let mut secondary_storage = RocksdbStorage::builder(self.state_keeper_db_path.as_ref())
-            .await
-            .expect("Failed initializing state keeper storage");
-        secondary_storage.enable_enum_index_migration(self.enum_index_migration_chunk_size);
-        let mut conn = self
-            .pool
-            .access_storage_tagged("state_keeper")
-            .await
-            .unwrap();
-        let secondary_storage = secondary_storage
-            .synchronize(&mut conn, stop_receiver)
-            .await
-            .expect("Failed synchronizing secondary state keeper storage")?;
-
         // Since we process `BatchExecutor` commands one-by-one (the next command is never enqueued
         // until a previous command is processed), capacity 1 is enough for the commands channel.
         let (commands_sender, commands_receiver) = mpsc::channel(1);
@@ -94,13 +82,29 @@ impl BatchExecutor for MainBatchExecutor {
         };
         let upload_witness_inputs_to_gcs = self.upload_witness_inputs_to_gcs;
 
-        let handle = tokio::task::spawn_blocking(move || {
-            executor.run(
-                secondary_storage,
-                l1_batch_params,
-                system_env,
-                upload_witness_inputs_to_gcs,
-            )
+        let mut storage = self.secondary_storage.clone();
+        let pool = self.pool.clone();
+        let stop_receiver = stop_receiver.clone();
+        let state_keeper_db_path = self.state_keeper_db_path.clone();
+        let enum_index_migration_chunk_size = self.enum_index_migration_chunk_size;
+        let handle = tokio::task::spawn(async move {
+            if let Some(storage) = storage
+                .access_storage(
+                    &pool,
+                    state_keeper_db_path.as_ref(),
+                    enum_index_migration_chunk_size,
+                    &stop_receiver,
+                )
+                .await
+                .unwrap()
+            {
+                executor.run(
+                    storage,
+                    l1_batch_params,
+                    system_env,
+                    upload_witness_inputs_to_gcs,
+                );
+            }
         });
         Some(BatchExecutorHandle {
             handle,
@@ -124,9 +128,9 @@ struct CommandReceiver {
 }
 
 impl CommandReceiver {
-    pub(super) fn run(
+    pub(super) fn run<S: ReadStorage>(
         mut self,
-        secondary_storage: RocksdbStorage,
+        secondary_storage: S,
         l1_batch_params: L1BatchEnv,
         system_env: SystemEnv,
         upload_witness_inputs_to_gcs: bool,

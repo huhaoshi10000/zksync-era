@@ -22,15 +22,21 @@
 use std::{
     collections::HashMap,
     convert::TryInto,
+    fmt::Debug,
     mem,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 
 use anyhow::Context as _;
 use itertools::{Either, Itertools};
-use tokio::sync::watch;
-use zksync_dal::StorageProcessor;
+use tokio::{
+    runtime::Handle,
+    sync::{watch, RwLock},
+    task::JoinHandle,
+};
+use zksync_dal::{ConnectionPool, StorageProcessor};
 use zksync_storage::{db::NamedColumnFamily, RocksDB};
 use zksync_types::{L1BatchNumber, StorageKey, StorageValue, H256, U256};
 use zksync_utils::{h256_to_u256, u256_to_h256};
@@ -38,7 +44,7 @@ use zksync_utils::{h256_to_u256, u256_to_h256};
 use self::metrics::METRICS;
 #[cfg(test)]
 use self::tests::RocksdbStorageEventListener;
-use crate::{InMemoryStorage, ReadStorage};
+use crate::{InMemoryStorage, PostgresStorage, ReadStorage};
 
 mod metrics;
 mod recovery;
@@ -661,5 +667,194 @@ impl ReadStorage for RocksdbStorage {
         // only be deployed when the migration is finished.
         Self::read_state_value(&self.db, key.hashed_key())
             .map(|state_value| state_value.enum_index.unwrap())
+    }
+}
+
+enum RocksdbSyncStatus {
+    InProgress(JoinHandle<anyhow::Result<bool>>),
+    Interrupted,
+    Error,
+    Finished,
+}
+
+impl RocksdbSyncStatus {
+    async fn try_to_finalize(&mut self) -> anyhow::Result<Option<bool>> {
+        match self {
+            RocksdbSyncStatus::InProgress(handle) => {
+                if handle.is_finished() {
+                    let result = handle.await?;
+                    match result {
+                        Ok(finished) => {
+                            if finished {
+                                *self = RocksdbSyncStatus::Finished;
+                                Ok(Some(true))
+                            } else {
+                                *self = RocksdbSyncStatus::Interrupted;
+                                Ok(Some(false))
+                            }
+                        }
+                        Err(err) => {
+                            *self = RocksdbSyncStatus::Error;
+                            Err(err)
+                        }
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            Self::Interrupted => Ok(Some(false)),
+            Self::Error => Ok(Some(false)),
+            Self::Finished => Ok(Some(true)),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SynchonizingRocksdb {
+    sync_status: Arc<RwLock<RocksdbSyncStatus>>,
+}
+
+impl Debug for SynchonizingRocksdb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SynchonizingRocksdb").finish()
+    }
+}
+
+impl SynchonizingRocksdb {
+    async fn is_sync_finished(&mut self) -> anyhow::Result<Option<bool>> {
+        let mut sync_status = self.sync_status.write().await;
+        let is_sync_finished = sync_status.try_to_finalize().await?;
+        drop(sync_status);
+        Ok(is_sync_finished)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncrhonizedRocksdb {}
+
+#[derive(Debug, Clone)]
+pub enum SecondaryStorage {
+    NotInitialized,
+    Synchronizing(SynchonizingRocksdb),
+    Synchronized(SyncrhonizedRocksdb),
+}
+
+impl SecondaryStorage {
+    pub fn new() -> SecondaryStorage {
+        SecondaryStorage::NotInitialized
+    }
+
+    async fn initialize(
+        pool: ConnectionPool,
+        state_keeper_db_path: &str,
+        enum_index_migration_chunk_size: usize,
+        stop_receiver: watch::Receiver<bool>,
+    ) -> anyhow::Result<Self> {
+        let mut rocksdb = RocksdbStorage::builder(state_keeper_db_path.as_ref())
+            .await
+            .expect("Failed initializing state keeper storage");
+        rocksdb.enable_enum_index_migration(enum_index_migration_chunk_size);
+        let handle = tokio::task::spawn(async move {
+            let mut storage = pool.access_storage().await?;
+            match rocksdb
+                .0
+                .update_from_postgres(&mut storage, &stop_receiver.clone())
+                .await
+            {
+                Ok(()) => Ok(true),
+                Err(RocksdbSyncError::Interrupted) => Ok(false),
+                Err(RocksdbSyncError::Internal(err)) => Err(err),
+            }
+        });
+        Ok(SecondaryStorage::Synchronizing(SynchonizingRocksdb {
+            sync_status: Arc::new(RwLock::new(RocksdbSyncStatus::InProgress(handle))),
+        }))
+    }
+
+    async fn access_storage_pg<'a>(
+        pool: &'a ConnectionPool,
+    ) -> anyhow::Result<Box<dyn ReadStorage + Send + 'a>> {
+        let rt_handle = Handle::current();
+        let mut connection = pool.access_storage().await?;
+        let block_number = connection
+            .blocks_dal()
+            .get_sealed_miniblock_number()
+            .await?
+            .unwrap_or(0.into());
+        Ok(Box::new(PostgresStorage::new(
+            rt_handle,
+            connection,
+            block_number,
+            true,
+        )) as Box<dyn ReadStorage + Send>)
+    }
+
+    pub async fn access_storage<'a>(
+        &mut self,
+        pool: &'a ConnectionPool,
+        state_keeper_db_path: &str,
+        enum_index_migration_chunk_size: usize,
+        stop_receiver: &watch::Receiver<bool>,
+    ) -> anyhow::Result<Option<Box<dyn ReadStorage + Send + 'a>>> {
+        match self {
+            SecondaryStorage::NotInitialized => {
+                *self = Self::initialize(
+                    pool.clone(),
+                    state_keeper_db_path,
+                    enum_index_migration_chunk_size,
+                    stop_receiver.clone(),
+                )
+                .await?;
+                Ok(Some(Self::access_storage_pg(pool).await?))
+            }
+            SecondaryStorage::Synchronizing(synchronizing_state) => {
+                if let Some(finished) = synchronizing_state.is_sync_finished().await? {
+                    if finished {
+                        *self = SecondaryStorage::Synchronized(SyncrhonizedRocksdb {});
+                        Ok(Some(Self::access_storage_pg(pool).await?))
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(Some(Self::access_storage_pg(pool).await?))
+                }
+            }
+            SecondaryStorage::Synchronized(SyncrhonizedRocksdb {}) => {
+                let mut rocksdb = RocksdbStorage::builder(state_keeper_db_path.as_ref())
+                    .await
+                    .expect("Failed initializing state keeper storage");
+                rocksdb.enable_enum_index_migration(enum_index_migration_chunk_size);
+                let mut conn = pool.access_storage_tagged("state_keeper").await.unwrap();
+                let Some(latest_l1_batch_number) = conn
+                    .blocks_dal()
+                    .get_sealed_l1_batch_number()
+                    .await
+                    .context("failed fetching sealed L1 batch number")?
+                else {
+                    return Ok(Some(Box::new(rocksdb.0)));
+                };
+                let current_l1_batch_number = rocksdb
+                    .0
+                    .ensure_ready(&mut conn, 200_000, stop_receiver)
+                    .await
+                    .unwrap();
+                if current_l1_batch_number < latest_l1_batch_number - 1000 {
+                    *self = Self::initialize(
+                        pool.clone(),
+                        state_keeper_db_path,
+                        enum_index_migration_chunk_size,
+                        stop_receiver.clone(),
+                    )
+                    .await?;
+                    Ok(Some(Self::access_storage_pg(pool).await?))
+                } else {
+                    Ok(rocksdb
+                        .synchronize(&mut conn, stop_receiver)
+                        .await
+                        .expect("Failed synchronizing secondary state keeper storage")
+                        .map(|x| Box::new(x) as Box<dyn ReadStorage + Send>))
+                }
+            }
+        }
     }
 }
